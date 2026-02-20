@@ -1,0 +1,212 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '*.md'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      apps_domain:
+        description: 'Apps domain for environment URL (e.g. apps.example.com)'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: task-manager
+  GITOPS_REPO: ${{ vars.GITOPS_REPO || 'gitops-apps' }}
+  GITOPS_OWNER: ${{ vars.GITOPS_OWNER || github.repository_owner }}
+  APPS_DOMAIN: ${{ inputs.apps_domain || vars.APPS_DOMAIN || '' }}
+  APPS_ACM_CERT_ARN: ${{ vars.APPS_ACM_CERT_ARN || '' }}
+
+jobs:
+  deploy:
+    name: Build, Push & Update GitOps
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Validate required configuration
+        env:
+          CHECK_AWS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          CHECK_AWS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CHECK_GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          FAILED=false
+          [ -z "$CHECK_AWS_KEY" ]      && { echo "::error::Missing secret: AWS_ACCESS_KEY_ID"; FAILED=true; }
+          [ -z "$CHECK_AWS_SECRET" ]   && { echo "::error::Missing secret: AWS_SECRET_ACCESS_KEY"; FAILED=true; }
+          [ -z "$CHECK_GITOPS_TOKEN" ] && { echo "::error::Missing secret: GITOPS_TOKEN"; FAILED=true; }
+          if [ "$FAILED" = "true" ]; then
+            echo "Configure missing items in: Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          echo "All required configuration is present"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip if no setup done yet
+        if: github.event_name == 'push'
+        run: |
+          if [ -z "$(git tag -l 'v*')" ]; then
+            echo "No version tags found - setup.yml has not run yet. Skipping deploy."
+            echo "Run setup first via POST /api/apps/:appName/infra"
+            exit 1
+          fi
+
+      - name: Calculate next version
+        id: version
+        run: |
+          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            NEXT="1.0.0"
+          else
+            VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+            PATCH=$((PATCH + 1))
+            NEXT="$MAJOR.$MINOR.$PATCH"
+          fi
+          echo "version=$NEXT" >> $GITHUB_OUTPUT
+          echo "tag=v$NEXT" >> $GITHUB_OUTPUT
+          echo "Next version: v$NEXT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get ECR Repository URL
+        id: ecr
+        run: |
+          ECR_URL=$(aws ecr describe-repositories \
+            --repository-names ${{ env.PROJECT_NAME }} \
+            --query 'repositories[0].repositoryUri' --output text)
+          echo "repository_url=$ECR_URL" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image
+        env:
+          ECR_REPOSITORY: ${{ steps.ecr.outputs.repository_url }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker build -t $ECR_REPOSITORY:$VERSION .
+          docker push $ECR_REPOSITORY:$VERSION
+
+      - name: Update image tag in GitOps repo
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+          ECR_REPOSITORY: ${{ steps.ecr.outputs.repository_url }}
+        run: |
+          OVERLAY_PATH="apps/${{ env.PROJECT_NAME }}/overlays/$ENVIRONMENT/kustomization.yaml"
+
+          if [ "$ENVIRONMENT" = "dev" ]; then
+            OVERLAY_NS="task"
+          else
+            OVERLAY_NS="task-$ENVIRONMENT"
+          fi
+
+          EXISTING=$(curl -s -H "Authorization: Bearer $GITOPS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$OVERLAY_PATH" || echo "{}")
+          SHA=$(echo "$EXISTING" | jq -r '.sha // empty')
+
+          CONTENT=$(cat << KUSTOMIZE
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          namespace: $OVERLAY_NS
+
+          resources:
+            - ../../base
+
+          images:
+            - name: PLACEHOLDER_IMAGE
+              newName: $ECR_REPOSITORY
+              newTag: "$VERSION"
+          KUSTOMIZE
+          )
+
+          if [ -n "$APPS_DOMAIN" ] && [ "$ENVIRONMENT" != "prod" ]; then
+            ENV_HOST="task-manager-$ENVIRONMENT.$APPS_DOMAIN"
+            CONTENT="$CONTENT$(printf '\npatches:\n  - patch: |\n      - op: replace\n        path: /spec/rules/0/host\n        value: %s\n    target:\n      kind: Ingress\n      name: task-manager' "$ENV_HOST")"
+          fi
+
+          ENCODED=$(echo "$CONTENT" | base64 -w 0)
+          BODY="{\"message\":\"deploy: task-manager $ENVIRONMENT -> v$VERSION\",\"content\":\"$ENCODED\",\"branch\":\"main\""
+          if [ -n "$SHA" ]; then
+            BODY="$BODY,\"sha\":\"$SHA\""
+          fi
+          BODY="$BODY}"
+
+          curl -s --fail-with-body -X PUT \
+            -H "Authorization: Bearer $GITOPS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$OVERLAY_PATH" \
+            -d "$BODY"
+
+      - name: Tag release
+        env:
+          VERSION_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force
+          if git rev-parse "$VERSION_TAG" >/dev/null 2>&1; then
+            echo "Tag $VERSION_TAG already exists, skipping"
+          else
+            git tag "$VERSION_TAG"
+            git push origin "$VERSION_TAG"
+          fi
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+          COMMIT_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "## Deploy Successful :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** $COMMIT_SHA" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$APPS_DOMAIN" ]; then
+            PROTOCOL="http"
+            [ -n "$APPS_ACM_CERT_ARN" ] && PROTOCOL="https"
+            if [ "$ENVIRONMENT" = "prod" ]; then
+              APP_URL="${PROTOCOL}://task-manager.$APPS_DOMAIN"
+            else
+              APP_URL="${PROTOCOL}://task-manager-$ENVIRONMENT.$APPS_DOMAIN"
+            fi
+            echo "**Application URL:** $APP_URL" >> $GITHUB_STEP_SUMMARY
+            echo "**Health Check:** $APP_URL/health" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**GitOps Repo:** ${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}" >> $GITHUB_STEP_SUMMARY

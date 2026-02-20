@@ -1,0 +1,342 @@
+name: Setup Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      apps_domain:
+        description: 'Apps domain for environment URL (e.g. apps.example.com)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: task-manager
+  GITOPS_REPO: ${{ vars.GITOPS_REPO || 'gitops-apps' }}
+  GITOPS_OWNER: ${{ vars.GITOPS_OWNER || github.repository_owner }}
+  APPS_DOMAIN: ${{ inputs.apps_domain || vars.APPS_DOMAIN || '' }}
+  APPS_ACM_CERT_ARN: ${{ vars.APPS_ACM_CERT_ARN || '' }}
+
+jobs:
+  setup:
+    name: Create ECR, Build & Push Image
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Validate required configuration
+        env:
+          CHECK_AWS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          CHECK_AWS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CHECK_GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          CHECK_EKS_CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+        run: |
+          FAILED=false
+          [ -z "$CHECK_AWS_KEY" ]      && { echo "::error::Missing secret: AWS_ACCESS_KEY_ID"; FAILED=true; }
+          [ -z "$CHECK_AWS_SECRET" ]   && { echo "::error::Missing secret: AWS_SECRET_ACCESS_KEY"; FAILED=true; }
+          [ -z "$CHECK_GITOPS_TOKEN" ] && { echo "::error::Missing secret: GITOPS_TOKEN"; FAILED=true; }
+          [ -z "$CHECK_EKS_CLUSTER" ]  && { echo "::error::Missing variable: EKS_CLUSTER_NAME"; FAILED=true; }
+          if [ "$FAILED" = "true" ]; then
+            echo "Configure missing items in: Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          echo "All required configuration is present"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR repository (idempotent)
+        run: |
+          aws ecr create-repository \
+            --repository-name ${{ env.PROJECT_NAME }} \
+            --image-scanning-configuration scanOnPush=true \
+            2>/dev/null || echo "Repository already exists"
+
+      - name: Configure ECR lifecycle policy
+        run: |
+          aws ecr put-lifecycle-policy \
+            --repository-name ${{ env.PROJECT_NAME }} \
+            --lifecycle-policy-text '{
+              "rules": [
+                {
+                  "rulePriority": 1,
+                  "description": "Expire untagged images after 1 day",
+                  "selection": {
+                    "tagStatus": "untagged",
+                    "countType": "sinceImagePushed",
+                    "countUnit": "days",
+                    "countNumber": 1
+                  },
+                  "action": { "type": "expire" }
+                },
+                {
+                  "rulePriority": 2,
+                  "description": "Keep last 20 images for rollback",
+                  "selection": {
+                    "tagStatus": "any",
+                    "countType": "imageCountMoreThan",
+                    "countNumber": 20
+                  },
+                  "action": { "type": "expire" }
+                }
+              ]
+            }'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get ECR Repository URL
+        id: ecr
+        run: |
+          ECR_URL=$(aws ecr describe-repositories \
+            --repository-names ${{ env.PROJECT_NAME }} \
+            --query 'repositories[0].repositoryUri' --output text)
+          echo "repository_url=$ECR_URL" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image (v1.0.0)
+        env:
+          ECR_REPOSITORY: ${{ steps.ecr.outputs.repository_url }}
+        run: |
+          docker build -t $ECR_REPOSITORY:1.0.0 .
+          docker push $ECR_REPOSITORY:1.0.0
+
+      - name: Update image tag in GitOps repo
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          ECR_REPOSITORY: ${{ steps.ecr.outputs.repository_url }}
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+        run: |
+          OVERLAY_PATH="apps/${{ env.PROJECT_NAME }}/overlays/$ENVIRONMENT/kustomization.yaml"
+
+          # Derive namespace per environment (dev uses base namespace, others append suffix)
+          if [ "$ENVIRONMENT" = "dev" ]; then
+            OVERLAY_NS="task"
+          else
+            OVERLAY_NS="task-$ENVIRONMENT"
+          fi
+
+          # Get current file SHA (may not exist yet)
+          EXISTING=$(curl -s -H "Authorization: Bearer $GITOPS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$OVERLAY_PATH" || echo "{}")
+          SHA=$(echo "$EXISTING" | jq -r '.sha // empty')
+
+          CONTENT=$(cat << KUSTOMIZE
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          namespace: $OVERLAY_NS
+
+          resources:
+            - ../../base
+
+          images:
+            - name: PLACEHOLDER_IMAGE
+              newName: $ECR_REPOSITORY
+              newTag: "1.0.0"
+          KUSTOMIZE
+          )
+
+          if [ -n "$APPS_DOMAIN" ] && [ "$ENVIRONMENT" != "prod" ]; then
+            ENV_HOST="task-manager-$ENVIRONMENT.$APPS_DOMAIN"
+            CONTENT="$CONTENT$(printf '\npatches:\n  - patch: |\n      - op: replace\n        path: /spec/rules/0/host\n        value: %s\n    target:\n      kind: Ingress\n      name: task-manager' "$ENV_HOST")"
+          fi
+
+          ENCODED=$(echo "$CONTENT" | base64 -w 0)
+          BODY="{\"message\":\"deploy: task-manager $ENVIRONMENT -> 1.0.0\",\"content\":\"$ENCODED\",\"branch\":\"main\""
+          if [ -n "$SHA" ]; then
+            BODY="$BODY,\"sha\":\"$SHA\""
+          fi
+          BODY="$BODY}"
+
+          curl -s --fail-with-body -X PUT \
+            -H "Authorization: Bearer $GITOPS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$OVERLAY_PATH" \
+            -d "$BODY"
+
+      - name: Create ArgoCD Application for environment
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+        run: |
+          # Derive namespace per environment
+          if [ "$ENVIRONMENT" = "dev" ]; then
+            APP_NS="task"
+          else
+            APP_NS="task-$ENVIRONMENT"
+          fi
+
+          ARGO_PATH="argocd/task-manager-$ENVIRONMENT.yaml"
+
+          # Get SHA if file already exists (idempotent)
+          EXISTING=$(curl -s -H "Authorization: Bearer $GITOPS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$ARGO_PATH" || echo "{}")
+          SHA=$(echo "$EXISTING" | jq -r '.sha // empty')
+
+          ARGO_CONTENT=$(cat << ARGOAPP
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: task-manager-$ENVIRONMENT
+            namespace: argocd
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: https://github.com/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}.git
+              targetRevision: main
+              path: apps/task-manager/overlays/$ENVIRONMENT
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: $APP_NS
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+          ARGOAPP
+          )
+
+          ENCODED=$(echo "$ARGO_CONTENT" | base64 -w 0)
+          BODY="{\"message\":\"feat: add task-manager $ENVIRONMENT ArgoCD application\",\"content\":\"$ENCODED\",\"branch\":\"main\""
+          if [ -n "$SHA" ]; then
+            BODY="$BODY,\"sha\":\"$SHA\""
+          fi
+          BODY="$BODY}"
+
+          curl -s --fail-with-body -X PUT \
+            -H "Authorization: Bearer $GITOPS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$ARGO_PATH" \
+            -d "$BODY"
+
+          echo "ArgoCD Application created/updated: task-manager-$ENVIRONMENT (namespace: $APP_NS)"
+
+      - name: Bootstrap ArgoCD root-app (first time only)
+        env:
+          EKS_CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          RAW_EKS_CLUSTER="${EKS_CLUSTER:-}"
+          EKS_CLUSTER="$(printf '%s' "$RAW_EKS_CLUSTER" | tr -d '\r' | xargs)"
+
+          if ! [[ "$EKS_CLUSTER" =~ ^[0-9A-Za-z][A-Za-z0-9_-]*$ ]]; then
+            echo "::error::Invalid EKS_CLUSTER_NAME value after trim: '$EKS_CLUSTER'"
+            echo "Expected pattern: ^[0-9A-Za-z][A-Za-z0-9_-]*$"
+            exit 1
+          fi
+
+          aws eks update-kubeconfig --name "$EKS_CLUSTER" --region ${{ env.AWS_REGION }}
+
+          # Configure ArgoCD repository credentials (idempotent)
+          # Uses repo-creds pattern: covers all repos under https://github.com/<owner>
+          kubectl apply -f - << ARGOCREDS
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: gitops-repo-creds
+            namespace: argocd
+            labels:
+              argocd.argoproj.io/secret-type: repo-creds
+          type: Opaque
+          stringData:
+            type: git
+            url: https://github.com/${{ env.GITOPS_OWNER }}
+            username: git
+            password: "$GITOPS_TOKEN"
+          ARGOCREDS
+          echo "ArgoCD repo credentials configured"
+
+          if kubectl get application gitops-root -n argocd >/dev/null 2>&1; then
+            echo "ArgoCD root-app already exists, skipping"
+          else
+            cat > /tmp/root-app.yaml << EOF
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: gitops-root
+            namespace: argocd
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: https://github.com/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}.git
+              targetRevision: main
+              path: argocd
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: argocd
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+          EOF
+
+            kubectl apply -f /tmp/root-app.yaml
+            echo "ArgoCD root-app bootstrapped successfully"
+          fi
+
+      - name: Tag release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags --force
+          if git rev-parse "v1.0.0" >/dev/null 2>&1; then
+            echo "Tag v1.0.0 already exists, skipping"
+          else
+            git tag "v1.0.0"
+            git push origin "v1.0.0"
+          fi
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+          EKS_CLUSTER: ${{ vars.EKS_CLUSTER_NAME }}
+        run: |
+          echo "## Setup Successful :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v1.0.0" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$APPS_DOMAIN" ]; then
+            PROTOCOL="http"
+            [ -n "$APPS_ACM_CERT_ARN" ] && PROTOCOL="https"
+            if [ "$ENVIRONMENT" = "prod" ]; then
+              APP_URL="${PROTOCOL}://task-manager.$APPS_DOMAIN"
+            else
+              APP_URL="${PROTOCOL}://task-manager-$ENVIRONMENT.$APPS_DOMAIN"
+            fi
+            echo "**Application URL:** $APP_URL" >> $GITHUB_STEP_SUMMARY
+            echo "**Health Check:** $APP_URL/health" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**GitOps Repo:** ${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$EKS_CLUSTER" ]; then
+            echo "**ArgoCD Bootstrap:** Verified" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**ArgoCD Bootstrap:** Skipped (EKS_CLUSTER_NAME not set)" >> $GITHUB_STEP_SUMMARY
+          fi

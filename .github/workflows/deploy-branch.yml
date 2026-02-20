@@ -1,0 +1,201 @@
+name: Deploy Branch (Preview)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      branch:
+        description: 'Branch to build and deploy (leave empty to use current branch)'
+        required: false
+        default: ''
+      apps_domain:
+        description: 'Apps domain for preview URL (e.g. apps.example.com)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: task-manager
+  GITOPS_REPO: ${{ vars.GITOPS_REPO || 'gitops-apps' }}
+  GITOPS_OWNER: ${{ vars.GITOPS_OWNER || github.repository_owner }}
+  APPS_DOMAIN: ${{ inputs.apps_domain || vars.APPS_DOMAIN || '' }}
+  APPS_ACM_CERT_ARN: ${{ vars.APPS_ACM_CERT_ARN || '' }}
+
+jobs:
+  deploy-branch:
+    name: Build & Deploy Branch Preview
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Validate required configuration
+        env:
+          CHECK_AWS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          CHECK_AWS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CHECK_GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          FAILED=false
+          [ -z "$CHECK_AWS_KEY" ]      && { echo "::error::Missing secret: AWS_ACCESS_KEY_ID"; FAILED=true; }
+          [ -z "$CHECK_AWS_SECRET" ]   && { echo "::error::Missing secret: AWS_SECRET_ACCESS_KEY"; FAILED=true; }
+          [ -z "$CHECK_GITOPS_TOKEN" ] && { echo "::error::Missing secret: GITOPS_TOKEN"; FAILED=true; }
+          if [ "$FAILED" = "true" ]; then
+            echo "Configure missing items in: Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          echo "All required configuration is present"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get ECR Repository URL
+        id: ecr
+        run: |
+          ECR_URL=$(aws ecr describe-repositories \
+            --repository-names ${{ env.PROJECT_NAME }} \
+            --query 'repositories[0].repositoryUri' --output text)
+          echo "repository_url=$ECR_URL" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image
+        id: build
+        env:
+          ECR_REPOSITORY: ${{ steps.ecr.outputs.repository_url }}
+        run: |
+          TARGET_BRANCH="${{ inputs.branch || github.ref_name }}"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          SAFE_BRANCH=$(echo "$TARGET_BRANCH" | tr '[:upper:]' '[:lower:]' | tr '/._' '-' | tr -cd 'a-z0-9-' | cut -c1-20)
+          IMAGE_TAG="${SAFE_BRANCH}-${SHORT_SHA}"
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REPOSITORY:$IMAGE_TAG
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "safe_branch=$SAFE_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Create preview overlay in GitOps repo
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          IMAGE_TAG: ${{ steps.build.outputs.image_tag }}
+          SAFE_BRANCH: ${{ steps.build.outputs.safe_branch }}
+          ECR_REPOSITORY: ${{ steps.ecr.outputs.repository_url }}
+          APPS_DOMAIN: ${{ vars.APPS_DOMAIN || '' }}
+        run: |
+          PREVIEW_NS="task-preview-$SAFE_BRANCH"
+          OVERLAY_PATH="apps/${{ env.PROJECT_NAME }}/overlays/preview-$SAFE_BRANCH/kustomization.yaml"
+          ARGO_PATH="argocd/${{ env.PROJECT_NAME }}-preview-$SAFE_BRANCH.yaml"
+
+          # Create overlay kustomization
+          OVERLAY_CONTENT=$(cat << KUSTOMIZE
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          namespace: $PREVIEW_NS
+
+          resources:
+            - ../../base
+
+          images:
+            - name: PLACEHOLDER_IMAGE
+              newName: $ECR_REPOSITORY
+              newTag: "$IMAGE_TAG"
+          KUSTOMIZE
+          )
+
+          # Add ingress host patch for preview if APPS_DOMAIN is configured
+          if [ -n "$APPS_DOMAIN" ]; then
+            PREVIEW_HOST="task-manager-preview-$SAFE_BRANCH.$APPS_DOMAIN"
+            OVERLAY_CONTENT="$OVERLAY_CONTENT$(printf '\npatches:\n  - patch: |\n      - op: replace\n        path: /spec/rules/0/host\n        value: %s\n    target:\n      kind: Ingress\n      name: task-manager' "$PREVIEW_HOST")"
+          fi
+
+          # Create ArgoCD Application
+          ARGO_CONTENT=$(cat << ARGOAPP
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${{ env.PROJECT_NAME }}-preview-$SAFE_BRANCH
+            namespace: argocd
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: https://github.com/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}.git
+              targetRevision: main
+              path: apps/${{ env.PROJECT_NAME }}/overlays/preview-$SAFE_BRANCH
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: $PREVIEW_NS
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+          ARGOAPP
+          )
+
+          # Push both files atomically via GitHub Contents API
+          for FILE_PATH in "$OVERLAY_PATH" "$ARGO_PATH"; do
+            if [ "$FILE_PATH" = "$OVERLAY_PATH" ]; then
+              CONTENT="$OVERLAY_CONTENT"
+            else
+              CONTENT="$ARGO_CONTENT"
+            fi
+
+            EXISTING=$(curl -s -H "Authorization: Bearer $GITOPS_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$FILE_PATH" || echo "{}")
+            SHA=$(echo "$EXISTING" | jq -r '.sha // empty')
+
+            ENCODED=$(echo "$CONTENT" | base64 -w 0)
+            BODY="{\"message\":\"feat: preview ${{ env.PROJECT_NAME }}/$SAFE_BRANCH\",\"content\":\"$ENCODED\",\"branch\":\"main\""
+            if [ -n "$SHA" ]; then
+              BODY="$BODY,\"sha\":\"$SHA\""
+            fi
+            BODY="$BODY}"
+
+            curl -s --fail-with-body -X PUT \
+              -H "Authorization: Bearer $GITOPS_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}/contents/$FILE_PATH" \
+              -d "$BODY"
+          done
+
+      - name: Summary
+        env:
+          IMAGE_TAG: ${{ steps.build.outputs.image_tag }}
+          SAFE_BRANCH: ${{ steps.build.outputs.safe_branch }}
+        run: |
+          echo "## Branch Deploy Successful :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** $IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "**Preview Namespace:** task-preview-$SAFE_BRANCH" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$APPS_DOMAIN" ]; then
+            PROTOCOL="http"
+            [ -n "$APPS_ACM_CERT_ARN" ] && PROTOCOL="https"
+            echo "**Preview URL:** ${PROTOCOL}://task-manager-preview-$SAFE_BRANCH.$APPS_DOMAIN" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**GitOps Repo:** ${{ env.GITOPS_OWNER }}/${{ env.GITOPS_REPO }}" >> $GITHUB_STEP_SUMMARY
