@@ -2,6 +2,7 @@ import express from "express";
 import swaggerUi from "swagger-ui-express";
 import swaggerJsdoc from "swagger-jsdoc";
 import healthRoutes from "./routes/health.js";
+import tasksRoutes from "./routes/tasks.js";
 import errorHandler from "./middleware/errorHandler.js";
 
 const app = express();
@@ -25,6 +26,7 @@ app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.get("/openapi.json", (_req, res) => res.json(swaggerSpec));
 
 app.use(healthRoutes);
+app.use("/tasks", tasksRoutes);
 
 // Error handler (must be last)
 app.use(errorHandler);

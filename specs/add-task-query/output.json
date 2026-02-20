@@ -1,0 +1,126 @@
+{
+  "appName": "task-manager",
+  "proposal": {
+    "changeId": "add-task-query",
+    "title": "Consulta de Tarefas por ID e Listagem",
+    "why": "Permitir a consulta de tarefas específicas por ID e listagem de todas as tarefas cadastradas, complementando as funcionalidades de registro e conclusão já existentes no sistema.",
+    "whatChanges": [
+      "Endpoint GET /tasks/{id} para consultar tarefa específica",
+      "Endpoint GET /tasks para listar todas as tarefas",
+      "Retorno de erro 404 quando tarefa não existir",
+      "Ordenação por data de criação (mais recentes primeiro)"
+    ],
+    "impact": {
+      "affectedAreas": [
+        "src/controllers/task-controller.ts",
+        "src/app.ts"
+      ],
+      "isBreaking": false,
+      "riskLevel": "low"
+    }
+  },
+  "specs": [
+    {
+      "capability": "task-query-by-id",
+      "operation": "ADDED",
+      "requirements": [
+        {
+          "name": "Consulta de Tarefa por ID",
+          "description": "O sistema DEVE permitir consultar uma tarefa específica através do endpoint GET /tasks/{id}, retornando todos os dados da tarefa (id, title, description, status, created_at, updated_at)",
+          "priority": "must",
+          "scenarios": [
+            {
+              "name": "Consulta tarefa existente",
+              "when": "GET /tasks/{id} é chamado com um ID de tarefa existente",
+              "then": "Retorna status 200 com os dados completos da tarefa (id, title, description, status, created_at, updated_at)"
+            },
+            {
+              "name": "Consulta tarefa inexistente",
+              "when": "GET /tasks/{id} é chamado com um ID de tarefa que não existe",
+              "then": "Retorna status 404 com mensagem de erro apropriada"
+            },
+            {
+              "name": "Consulta é idempotente",
+              "when": "GET /tasks/{id} é chamado múltiplas vezes para a mesma tarefa",
+              "then": "Retorna sempre os mesmos dados sem alterar o estado da tarefa"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "capability": "task-list",
+      "operation": "ADDED",
+      "requirements": [
+        {
+          "name": "Listagem de Tarefas",
+          "description": "O sistema DEVE permitir listar todas as tarefas cadastradas através do endpoint GET /tasks, ordenadas por data de criação (mais recentes primeiro)",
+          "priority": "must",
+          "scenarios": [
+            {
+              "name": "Lista tarefas existentes",
+              "when": "GET /tasks é chamado e existem tarefas cadastradas",
+              "then": "Retorna status 200 com array de tarefas contendo id, title e status, ordenadas por created_at decrescente"
+            },
+            {
+              "name": "Lista vazia",
+              "when": "GET /tasks é chamado e não existem tarefas cadastradas",
+              "then": "Retorna status 200 com array vazio []"
+            },
+            {
+              "name": "Listagem é idempotente",
+              "when": "GET /tasks é chamado múltiplas vezes",
+              "then": "Retorna sempre os mesmos dados sem alterar o estado das tarefas"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "category": "implementation",
+      "dependencies": [],
+      "description": "Criar interface Task com campos: id (string UUID), title (string), description (string | null), status (enum 'PENDING' | 'DONE'), created_at (Date), updated_at (Date). Criar interface TaskListItem com campos resumidos: id, title, status. Criar em src/models/task.ts. Exportar tipos para uso no controller.",
+      "id": "1.1",
+      "title": "Criar modelo Task e tipos de resposta"
+    },
+    {
+      "category": "implementation",
+      "dependencies": [
+        "1.1"
+      ],
+      "description": "Criar src/repositories/task-repository.ts com armazenamento em memória (Map<string, Task>). Implementar métodos: findById(id: string): Task | undefined - busca tarefa por ID; findAll(): Task[] - retorna todas as tarefas ordenadas por created_at decrescente. Exportar instância singleton do repositório.",
+      "id": "1.2",
+      "title": "Criar repositório de tarefas com operações de consulta"
+    },
+    {
+      "category": "implementation",
+      "dependencies": [
+        "1.2"
+      ],
+      "description": "Criar src/controllers/task-controller.ts com decorators tsoa: @Route('tasks'), @Tags('Tasks'). Implementar GET /tasks/{id} com @Get('{id}') retornando Task completa ou erro 404 (usar @Response<NotFoundError>(404)). Implementar GET /tasks com @Get() retornando array de TaskListItem. Registrar RegisterRoutes no src/app.ts. Usar imports com extensão .js.",
+      "id": "2.1",
+      "title": "Criar TaskController com endpoints de consulta e registrar rotas"
+    },
+    {
+      "category": "testing",
+      "dependencies": [
+        "2.1"
+      ],
+      "description": "Criar src/tests/task-query.test.ts. Testar GET /tasks/{id}: cenário sucesso (200 com dados completos), cenário erro (404 para ID inexistente). Testar GET /tasks: cenário lista vazia (200 com []), cenário com tarefas (200 com array ordenado por created_at desc). Verificar idempotência das consultas.",
+      "id": "3.1",
+      "title": "Implementar testes dos endpoints de consulta"
+    }
+  ],
+  "summary": "Proposta add-task-query criada para task-manager. Adiciona 2 endpoints de consulta: GET /tasks/{id} para buscar tarefa específica com dados completos e GET /tasks para listar todas as tarefas ordenadas por data de criação. Implementação em 4 tasks: modelo de dados, repositório em memória, controller tsoa com rotas registradas, e testes de integração.",
+  "validationNotes": [
+    "Endpoints são idempotentes (GET) - não alteram estado",
+    "Ordenação por created_at decrescente implementada no repositório",
+    "Erro 404 tratado para tarefa inexistente",
+    "Modelo Task reutilizável para futuras funcionalidades (registro/conclusão)",
+    "TaskListItem com campos resumidos para listagem otimizada",
+    "Repositório em memória suporta até 1.000 tarefas conforme requisito",
+    "Imports usando extensão .js para compatibilidade ESM/NodeNext"
+  ]
+}
